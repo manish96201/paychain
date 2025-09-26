@@ -1,1 +1,254 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
 
+/**
+ * @title PayChain
+ * @dev A decentralized payment management system with escrow functionality
+ */
+contract PayChain {
+    
+    // State variables
+    address public owner;
+    uint256 public totalTransactions;
+    uint256 public platformFeePercentage; // Fee in basis points (100 = 1%)
+    
+    // Structures
+    struct Transaction {
+        uint256 id;
+        address payer;
+        address payee;
+        uint256 amount;
+        uint256 timestamp;
+        TransactionStatus status;
+        string description;
+    }
+    
+    struct EscrowPayment {
+        uint256 id;
+        address payer;
+        address payee;
+        uint256 amount;
+        uint256 releaseTime;
+        bool isReleased;
+        bool isRefunded;
+        string terms;
+    }
+    
+    enum TransactionStatus { Pending, Completed, Failed, Refunded }
+    
+    // Mappings
+    mapping(uint256 => Transaction) public transactions;
+    mapping(uint256 => EscrowPayment) public escrowPayments;
+    mapping(address => uint256) public userBalances;
+    mapping(address => uint256[]) public userTransactions;
+    
+    // Events
+    event PaymentSent(
+        uint256 indexed transactionId,
+        address indexed payer,
+        address indexed payee,
+        uint256 amount,
+        string description
+    );
+    
+    event EscrowCreated(
+        uint256 indexed escrowId,
+        address indexed payer,
+        address indexed payee,
+        uint256 amount,
+        uint256 releaseTime
+    );
+    
+    event EscrowReleased(
+        uint256 indexed escrowId,
+        address indexed payee,
+        uint256 amount
+    );
+    
+    event BalanceWithdrawn(
+        address indexed user,
+        uint256 amount
+    );
+    
+    // Modifiers
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    modifier validAmount(uint256 _amount) {
+        require(_amount > 0, "Amount must be greater than 0");
+        _;
+    }
+    
+    modifier validAddress(address _addr) {
+        require(_addr != address(0), "Invalid address");
+        _;
+    }
+    
+    // Constructor
+    constructor() {
+        owner = msg.sender;
+        platformFeePercentage = 250; // 2.5% default fee
+    }
+    
+    /**
+     * @dev Core Function 1: Send direct payment to another address
+     * @param _payee The address to receive the payment
+     * @param _description Description of the payment
+     */
+    function sendPayment(
+        address _payee,
+        string memory _description
+    ) 
+        external 
+        payable 
+        validAmount(msg.value) 
+        validAddress(_payee) 
+    {
+        require(_payee != msg.sender, "Cannot send payment to yourself");
+        
+        uint256 platformFee = (msg.value * platformFeePercentage) / 10000;
+        uint256 payeeAmount = msg.value - platformFee;
+        
+        // Create transaction record
+        totalTransactions++;
+        transactions[totalTransactions] = Transaction({
+            id: totalTransactions,
+            payer: msg.sender,
+            payee: _payee,
+            amount: msg.value,
+            timestamp: block.timestamp,
+            status: TransactionStatus.Completed,
+            description: _description
+        });
+        
+        // Update balances
+        userBalances[_payee] += payeeAmount;
+        userBalances[owner] += platformFee;
+        
+        // Update user transaction history
+        userTransactions[msg.sender].push(totalTransactions);
+        userTransactions[_payee].push(totalTransactions);
+        
+        emit PaymentSent(totalTransactions, msg.sender, _payee, msg.value, _description);
+    }
+    
+    /**
+     * @dev Core Function 2: Create escrow payment with time-based release
+     * @param _payee The address to receive the payment after release
+     * @param _releaseTime Timestamp when payment can be released
+     * @param _terms Terms and conditions of the escrow
+     */
+    function createEscrowPayment(
+        address _payee,
+        uint256 _releaseTime,
+        string memory _terms
+    ) 
+        external 
+        payable 
+        validAmount(msg.value) 
+        validAddress(_payee) 
+    {
+        require(_payee != msg.sender, "Cannot create escrow to yourself");
+        require(_releaseTime > block.timestamp, "Release time must be in the future");
+        
+        totalTransactions++;
+        escrowPayments[totalTransactions] = EscrowPayment({
+            id: totalTransactions,
+            payer: msg.sender,
+            payee: _payee,
+            amount: msg.value,
+            releaseTime: _releaseTime,
+            isReleased: false,
+            isRefunded: false,
+            terms: _terms
+        });
+        
+        emit EscrowCreated(totalTransactions, msg.sender, _payee, msg.value, _releaseTime);
+    }
+    
+    /**
+     * @dev Core Function 3: Release escrow payment (can be called by payer or after time expires)
+     * @param _escrowId The ID of the escrow payment to release
+     */
+    function releaseEscrowPayment(uint256 _escrowId) external {
+        EscrowPayment storage escrow = escrowPayments[_escrowId];
+        
+        require(escrow.amount > 0, "Escrow does not exist");
+        require(!escrow.isReleased, "Escrow already released");
+        require(!escrow.isRefunded, "Escrow already refunded");
+        require(
+            msg.sender == escrow.payer || block.timestamp >= escrow.releaseTime,
+            "Not authorized to release or time not reached"
+        );
+        
+        uint256 platformFee = (escrow.amount * platformFeePercentage) / 10000;
+        uint256 payeeAmount = escrow.amount - platformFee;
+        
+        escrow.isReleased = true;
+        
+        // Update balances
+        userBalances[escrow.payee] += payeeAmount;
+        userBalances[owner] += platformFee;
+        
+        emit EscrowReleased(_escrowId, escrow.payee, escrow.amount);
+    }
+    
+    /**
+     * @dev Withdraw available balance
+     */
+    function withdrawBalance() external {
+        uint256 balance = userBalances[msg.sender];
+        require(balance > 0, "No balance to withdraw");
+        
+        userBalances[msg.sender] = 0;
+        payable(msg.sender).transfer(balance);
+        
+        emit BalanceWithdrawn(msg.sender, balance);
+    }
+    
+    /**
+     * @dev Refund escrow payment (only by payer and before release time)
+     * @param _escrowId The ID of the escrow payment to refund
+     */
+    function refundEscrowPayment(uint256 _escrowId) external {
+        EscrowPayment storage escrow = escrowPayments[_escrowId];
+        
+        require(escrow.amount > 0, "Escrow does not exist");
+        require(msg.sender == escrow.payer, "Only payer can request refund");
+        require(!escrow.isReleased, "Escrow already released");
+        require(!escrow.isRefunded, "Escrow already refunded");
+        require(block.timestamp < escrow.releaseTime, "Cannot refund after release time");
+        
+        escrow.isRefunded = true;
+        userBalances[escrow.payer] += escrow.amount;
+    }
+    
+    // View functions
+    function getTransactionHistory(address _user) external view returns (uint256[] memory) {
+        return userTransactions[_user];
+    }
+    
+    function getContractBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+    
+    function getUserBalance(address _user) external view returns (uint256) {
+        return userBalances[_user];
+    }
+    
+    // Owner functions
+    function setPlatformFee(uint256 _feePercentage) external onlyOwner {
+        require(_feePercentage <= 1000, "Fee cannot exceed 10%"); // Max 10%
+        platformFeePercentage = _feePercentage;
+    }
+    
+    function withdrawPlatformFees() external onlyOwner {
+        uint256 fees = userBalances[owner];
+        require(fees > 0, "No fees to withdraw");
+        
+        userBalances[owner] = 0;
+        payable(owner).transfer(fees);
+    }
+}
